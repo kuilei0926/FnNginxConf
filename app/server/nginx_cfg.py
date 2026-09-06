@@ -47,6 +47,11 @@ RESERVED_PREFIXES = ["/app", "/cgi"]
 # recover 模块出错日志格式串, 用于精确定位 key 缓冲区
 PWD_STR = b"archive_read_add_passphrase: %s, key: %s"
 
+# 兜底密码: 在已知 x86-64 飞牛镜像上从 nginx 二进制提取并实测可用的密码。
+# 当本机指令集无法抠取(如 arm64 RK3528A/ophub-fnnas)或抠出的密码无法解压时,
+# 直接用它对 ng.conf.zip 重试, 实现不依赖抠二进制的注入方式。
+FALLBACK_PASSWORD = b"4yXDSVzwVJuMZew2JqmmfMdu"
+
 # location 解析：location [modifier] target
 _LOC_RE = re.compile(r"(?m)^\s*location\s+(?:(\^~|=|~\*?)\s+)?([^\s{]+)")
 
@@ -142,6 +147,24 @@ def _file_to_vaddr(secs, off):
     return off
 
 
+def _vaddr_to_off(secs, vaddr):
+    for _, (soff, svaddr, ssize) in secs.items():
+        if svaddr <= vaddr < svaddr + ssize:
+            return soff + (vaddr - svaddr)
+    return None
+
+
+EM_X86_64 = 62
+EM_AARCH64 = 183
+
+
+def _elf_machine(data):
+    """读 ELF e_machine: 62=x86-64, 183=AArch64。"""
+    if len(data) < 0x14 or data[:4] != b"\x7fELF":
+        return None
+    return struct.unpack_from("<H", data, 0x12)[0]
+
+
 def _lea_rip_targets(text, text_vaddr):
     """扫描 .text, 找 64 位 RIP 相对 lea (REX 8D ModRM mod=00 rm=101), 返回 (指令地址, 目标地址)"""
     out = []
@@ -167,8 +190,66 @@ def _lea_rip_targets(text, text_vaddr):
     return out
 
 
+_A64_ADR_MASK = 0x9F000000
+_A64_ADR_VAL = 0x10000000
+_A64_ADRP_VAL = 0x90000000
+_A64_ADD_IMM_MASK = 0xFF000000
+_A64_ADD_IMM_VAL = 0x91000000
+_A64_LDR_LIT_MASK = 0xFF000000
+_A64_LDR_LIT_VAL = 0x58000000
+
+
+def _a64_sx(v, bits):
+    s = 1 << (bits - 1)
+    return (v ^ s) - s
+
+
+def _a64_ref_targets(text, text_vaddr, data, secs):
+    """扫描 .text, 提取 AArch64 内存引用 (指令地址, 目标地址)。
+
+    - ADR: PC 相对字节级寻址, 直接给出目标地址
+    - ADRP + ADD(imm): 页寻址 + 页内偏移, 合并为精确地址
+    - LDR literal: 字面量池加载, 解引用池中 8 字节小端值
+    """
+    out = []
+    pages = {}
+    n = len(text)
+    for i in range(0, n - 3, 4):
+        w = struct.unpack_from("<I", text, i)[0]
+        addr = text_vaddr + i
+        if (w & _A64_ADR_MASK) == _A64_ADRP_VAL:
+            imm = _a64_sx(((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3), 21)
+            pages[addr] = ((addr & ~0xFFF) + (imm << 12), w & 0x1F)
+        elif (w & _A64_ADR_MASK) == _A64_ADR_VAL:
+            imm = _a64_sx(((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3), 21)
+            out.append((addr, addr + imm))
+        elif (w & _A64_LDR_LIT_MASK) == _A64_LDR_LIT_VAL:
+            imm = _a64_sx((w >> 5) & 0x7FFFF, 19)
+            lit = addr + (imm << 2)
+            target = lit
+            off = _vaddr_to_off(secs, lit)
+            if off is not None and off + 8 <= len(data):
+                target = struct.unpack_from("<Q", data, off)[0]
+            out.append((addr, target))
+    for addr, (page, rd) in pages.items():
+        off = addr - text_vaddr
+        for j in range(off + 4, min(off + 24, n - 3), 4):
+            w = struct.unpack_from("<I", text, j)[0]
+            if (w & _A64_ADD_IMM_MASK) == _A64_ADD_IMM_VAL and ((w >> 5) & 0x1F) == rd:
+                imm12 = (w >> 10) & 0xFFF
+                shift = 12 if (w >> 22) & 1 else 0
+                out.append((addr, page + (imm12 << shift)))
+                break
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def _extract_precise(data):
-    """精确法: 定位 PWD_STR 的引用, 回溯到 key 缓冲区。"""
+    """精确法: 定位 PWD_STR 的引用, 回溯到 key 缓冲区。
+    x86-64 (EM_X86_64=62) 走 lea RIP-relative, arm64 (EM_AARCH64=183) 走 adr/adrp+add,
+    其它架构返回 None。"""
+    if len(data) < 0x14 or data[:4] != b"\x7fELF":
+        return None
     secs = _elf_sections(data)
     t = secs.get(".text")
     if not t:
@@ -179,22 +260,31 @@ def _extract_precise(data):
         return None
     pwd_vaddr = _file_to_vaddr(secs, pwd_at)
     text = data[t_off:t_off + t_size]
-    leas = _lea_rip_targets(text, t_vaddr)
+    machine = _elf_machine(data)
+    if machine == EM_X86_64:
+        refs = _lea_rip_targets(text, t_vaddr)
+    elif machine == EM_AARCH64:
+        refs = _a64_ref_targets(text, t_vaddr, data, secs)
+    else:
+        return None
     site = None
-    for ins, target in leas:
+    for ins, target in refs:
         if target == pwd_vaddr:
             site = ins
             break
     if site is None:
         return None
-    for ins, target in reversed(leas):
+    for ins, target in reversed(refs):
         if ins >= site:
             continue
         if site - ins > 4096:
             break
-        if target + 24 > len(data):
+        off = _vaddr_to_off(secs, target)
+        if off is None:
+            off = target  # 回退: 旧行为 vaddr 直接当文件偏移
+        if off + 24 > len(data):
             continue
-        pw = _xor_pass(data[target:target + 24])
+        pw = _xor_pass(data[off:off + 24])
         if _is_plausible(pw):
             return pw
     return None
@@ -210,24 +300,57 @@ def _extract_heuristic(data):
     return out
 
 
+def _extract_candidates(data):
+    """按置信度返回候选密码: [精确法] + [启发式全部] (去重)。"""
+    cands = []
+    pw = _extract_precise(data)
+    if pw:
+        cands.append(pw)
+    for pw in _extract_heuristic(data):
+        if pw not in cands:
+            cands.append(pw)
+    return cands
+
+
 def get_password():
+    """返回能解压 ng.conf.zip 的密码 (带缓存):
+    1. 从 nginx 二进制提取候选 (x86-64 lea / arm64 adr-adrp-ldr + 启发式), 逐个实测;
+    2. 都不行则尝试兜底密码 FALLBACK_PASSWORD (不依赖抠二进制, 兼容 arm64);
+    3. zip 不存在时退回提取出的最佳候选。"""
     global _password_cache
     if _password_cache is not None:
         return _password_cache
-    if not os.path.exists(NGINX_BIN):
-        log("nginx 二进制不存在: %s" % NGINX_BIN)
-        return None
-    with open(NGINX_BIN, "rb") as f:
-        data = f.read()
-    pw = _extract_precise(data)
-    if pw is None:
-        cands = _extract_heuristic(data)
+    if os.path.exists(NGINX_BIN):
+        with open(NGINX_BIN, "rb") as f:
+            data = f.read()
+        arch = {EM_X86_64: "x86-64", EM_AARCH64: "AArch64"}.get(
+            _elf_machine(data), "unknown")
+        log("nginx 二进制架构: %s" % arch)
+        cands = _extract_candidates(data)
         if cands:
-            pw = cands[0]
-    if pw is None:
-        log("无法从 %s 提取 zip 密码" % NGINX_BIN)
+            log("已提取 ng.conf.zip 密码候选 %d 个" % len(cands))
+        else:
+            log("无法从 %s 提取 zip 密码" % NGINX_BIN)
     else:
-        log("已提取 ng.conf.zip 密码")
+        log("nginx 二进制不存在: %s" % NGINX_BIN)
+        cands = []
+
+    if os.path.exists(RESTORE_ZIP):
+        for pw in cands:
+            if _password_valid(RESTORE_ZIP, pw):
+                _password_cache = pw
+                return pw
+            log("二进制提取的密码解压失败, 尝试下一个候选")
+        if _password_valid(RESTORE_ZIP, FALLBACK_PASSWORD):
+            log("改用兜底密码")
+            _password_cache = FALLBACK_PASSWORD
+            return FALLBACK_PASSWORD
+        log("所有候选(含兜底密码)均无法解压 %s" % RESTORE_ZIP)
+        _password_cache = None
+        return None
+
+    # zip 不存在: 无法实测, 退回提取出的最佳候选 (或 None)
+    pw = cands[0] if cands else None
     _password_cache = pw
     return pw
 
@@ -305,14 +428,77 @@ def build_zip(entries, password):
 # ---------------------------------------------------------------------------
 
 
+def _read_entry_payload(f, info, password):
+    """按 local header 直接读出并解密单个条目。
+
+    厂商 zip 由 libarchive 生成, 设置 data descriptor 标志时会用 DOS 时间
+    高字节做校验字节(而非 CRC 高字节), 旧版 Python 的 zipfile 不认识该
+    约定, 密码正确也会误报 Bad password。这里两种约定都接受。
+    """
+    f.seek(info.header_offset)
+    hdr = f.read(30)
+    if len(hdr) < 30 or hdr[:4] != b"PK\x03\x04":
+        raise RuntimeError("%s: 无效的 local header" % info.filename)
+    _, flags, method, dtime, _, _, csize, _, nl, el = \
+        struct.unpack_from("<HHHHHIIIHH", hdr, 4)
+    if csize == 0:
+        csize = info.compress_size
+    f.seek(info.header_offset + 30 + nl + el)
+    if flags & 0x1:
+        enc = f.read(csize)
+        z = ZipCrypto(password)
+        check_crc = (info.CRC >> 24) & 0xFF
+        check_time = (dtime >> 8) & 0xFF
+        plain = bytearray()
+        for i, c in enumerate(enc):
+            p = c ^ z.keystream()
+            z.update(p)
+            if i < 11:
+                continue
+            if i == 11:
+                if p != check_crc and p != check_time:
+                    raise RuntimeError("Bad password for file %r" % info.filename)
+            else:
+                plain.append(p)
+        if info.CRC and zlib.crc32(plain) & 0xFFFFFFFF != info.CRC:
+            raise RuntimeError("%s: CRC 校验失败" % info.filename)
+    else:
+        plain = f.read(csize)
+    if method == 8:
+        return zlib.decompress(plain, -15)
+    if method != 0:
+        raise RuntimeError("%s: 不支持的压缩方法 %d" % (info.filename, method))
+    return bytes(plain)
+
+
 def read_zip_entries(zip_path, pwd):
+    """读回全部条目(含目录), 密码错误时抛异常。
+
+    解密不依赖 zipfile(见 _read_entry_payload), 避免旧版 Python 对
+    data descriptor 校验字节约定的兼容问题。
+    """
     with zipfile.ZipFile(zip_path) as zf:
-        entries = []
-        for info in zf.infolist():
-            payload = b"" if info.is_dir() else zf.read(info.filename, pwd=pwd)
-            mode = (info.external_attr >> 16) & 0xFFFF or 0o644
-            entries.append((info.filename, payload, info.date_time, mode))
+        with open(zip_path, "rb") as f:
+            entries = []
+            for info in zf.infolist():
+                if info.is_dir():
+                    mode = (info.external_attr >> 16) & 0xFFFF or 0o755
+                    entries.append((info.filename, b"", info.date_time, mode))
+                    continue
+                payload = _read_entry_payload(f, info, pwd)
+                mode = (info.external_attr >> 16) & 0xFFFF or 0o644
+                entries.append((info.filename, payload, info.date_time, mode))
     return entries
+
+
+def _password_valid(zip_path, password):
+    """验证密码能否完整读回 zip。"""
+    try:
+        read_zip_entries(zip_path, password)
+        return True
+    except Exception as e:
+        log("zip 密码验证失败: %s" % e)
+        return False
 
 
 def write_zip(zip_path, pwd, entries):
